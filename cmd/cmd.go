@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -18,10 +20,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
-	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,39 +35,69 @@ import (
 	"golang.org/x/term"
 
 	"github.com/ollama/ollama/api"
-	"github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/llama"
+	"github.com/ollama/ollama/llama/runner"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/server"
-	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
 )
 
+var (
+	errModelNotFound     = errors.New("no Modelfile or safetensors files found")
+	errModelfileNotFound = errors.New("specified Modelfile wasn't found")
+)
+
+func getModelfileName(cmd *cobra.Command) (string, error) {
+	fn, _ := cmd.Flags().GetString("file")
+
+	filename := fn
+	if filename == "" {
+		filename = "Modelfile"
+	}
+
+	absName, err := filepath.Abs(filename)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = os.Stat(absName)
+	if err != nil {
+		return fn, err
+	}
+
+	return absName, nil
+}
+
 func CreateHandler(cmd *cobra.Command, args []string) error {
-	filename, _ := cmd.Flags().GetString("file")
-	filename, err := filepath.Abs(filename)
-	if err != nil {
-		return err
-	}
-
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return err
-	}
-
 	p := progress.NewProgress(os.Stderr)
 	defer p.Stop()
 
-	f, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	var reader io.Reader
 
-	modelfile, err := parser.ParseFile(f)
+	filename, err := getModelfileName(cmd)
+	if os.IsNotExist(err) {
+		if filename == "" {
+			reader = strings.NewReader("FROM .\n")
+		} else {
+			return errModelfileNotFound
+		}
+	} else if err != nil {
+		return err
+	} else {
+		f, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+
+		reader = f
+		defer f.Close()
+	}
+
+	modelfile, err := parser.ParseFile(reader)
 	if err != nil {
 		return err
 	}
@@ -78,6 +110,12 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	status := "transferring model data"
 	spinner := progress.NewSpinner(status)
 	p.Add(status, spinner)
+	defer p.Stop()
+
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return err
+	}
 
 	for i := range modelfile.Commands {
 		switch modelfile.Commands[i].Name {
@@ -112,7 +150,7 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 				path = tempfile
 			}
 
-			digest, err := createBlob(cmd, client, path)
+			digest, err := createBlob(cmd, client, path, spinner)
 			if err != nil {
 				return err
 			}
@@ -202,6 +240,12 @@ func tempZipFiles(path string) (string, error) {
 		// safetensors files might be unresolved git lfs references; skip if they are
 		// covers model-x-of-y.safetensors, model.fp32-x-of-y.safetensors, model.safetensors
 		files = append(files, st...)
+	} else if st, _ := glob(filepath.Join(path, "adapters.safetensors"), "application/octet-stream"); len(st) > 0 {
+		// covers adapters.safetensors
+		files = append(files, st...)
+	} else if st, _ := glob(filepath.Join(path, "adapter_model.safetensors"), "application/octet-stream"); len(st) > 0 {
+		// covers adapter_model.safetensors
+		files = append(files, st...)
 	} else if pt, _ := glob(filepath.Join(path, "pytorch_model*.bin"), "application/zip"); len(pt) > 0 {
 		// pytorch files might also be unresolved git lfs references; skip if they are
 		// covers pytorch_model-x-of-y.bin, pytorch_model.fp32-x-of-y.bin, pytorch_model.bin
@@ -211,11 +255,19 @@ func tempZipFiles(path string) (string, error) {
 		// covers consolidated.x.pth, consolidated.pth
 		files = append(files, pt...)
 	} else {
-		return "", errors.New("no safetensors or torch files found")
+		return "", errModelNotFound
 	}
 
 	// add configuration files, json files are detected as text/plain
 	js, err := glob(filepath.Join(path, "*.json"), "text/plain")
+	if err != nil {
+		return "", err
+	}
+	files = append(files, js...)
+
+	// bert models require a nested config.json
+	// TODO(mxyng): merge this with the glob above
+	js, err = glob(filepath.Join(path, "**/*.json"), "text/plain")
 	if err != nil {
 		return "", err
 	}
@@ -250,6 +302,11 @@ func tempZipFiles(path string) (string, error) {
 			return "", err
 		}
 
+		zfi.Name, err = filepath.Rel(path, file)
+		if err != nil {
+			return "", err
+		}
+
 		zf, err := zipfile.CreateHeader(zfi)
 		if err != nil {
 			return "", err
@@ -263,12 +320,19 @@ func tempZipFiles(path string) (string, error) {
 	return tempfile.Name(), nil
 }
 
-func createBlob(cmd *cobra.Command, client *api.Client, path string) (string, error) {
+func createBlob(cmd *cobra.Command, client *api.Client, path string, spinner *progress.Spinner) (string, error) {
 	bin, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer bin.Close()
+
+	// Get file info to retrieve the size
+	fileInfo, err := bin.Stat()
+	if err != nil {
+		return "", err
+	}
+	fileSize := fileInfo.Size()
 
 	hash := sha256.New()
 	if _, err := io.Copy(hash, bin); err != nil {
@@ -279,11 +343,74 @@ func createBlob(cmd *cobra.Command, client *api.Client, path string) (string, er
 		return "", err
 	}
 
+	var pw progressWriter
+	status := "transferring model data 0%"
+	spinner.SetMessage(status)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		ticker := time.NewTicker(60 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				spinner.SetMessage(fmt.Sprintf("transferring model data %d%%", int(100*pw.n.Load()/fileSize)))
+			case <-done:
+				spinner.SetMessage("transferring model data 100%")
+				return
+			}
+		}
+	}()
+
 	digest := fmt.Sprintf("sha256:%x", hash.Sum(nil))
-	if err = client.CreateBlob(cmd.Context(), digest, bin); err != nil {
+	if err = client.CreateBlob(cmd.Context(), digest, io.TeeReader(bin, &pw)); err != nil {
 		return "", err
 	}
 	return digest, nil
+}
+
+type progressWriter struct {
+	n atomic.Int64
+}
+
+func (w *progressWriter) Write(p []byte) (n int, err error) {
+	w.n.Add(int64(len(p)))
+	return len(p), nil
+}
+
+func loadOrUnloadModel(cmd *cobra.Command, opts *runOptions) error {
+	p := progress.NewProgress(os.Stderr)
+	defer p.StopAndClear()
+
+	spinner := progress.NewSpinner("")
+	p.Add("", spinner)
+
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return err
+	}
+
+	req := &api.GenerateRequest{
+		Model:     opts.Model,
+		KeepAlive: opts.KeepAlive,
+	}
+
+	return client.Generate(cmd.Context(), req, func(api.GenerateResponse) error { return nil })
+}
+
+func StopHandler(cmd *cobra.Command, args []string) error {
+	opts := &runOptions{
+		Model:     args[0],
+		KeepAlive: &api.Duration{Duration: 0},
+	}
+	if err := loadOrUnloadModel(cmd, opts); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return fmt.Errorf("couldn't find model \"%s\" to stop", args[0])
+		}
+	}
+	return nil
 }
 
 func RunHandler(cmd *cobra.Command, args []string) error {
@@ -329,6 +456,10 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	if len(prompts) > 0 {
 		interactive = false
 	}
+	// Be quiet if we're redirecting to a pipe or file
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		interactive = false
+	}
 
 	nowrap, err := cmd.Flags().GetBool("nowordwrap")
 	if err != nil {
@@ -360,55 +491,29 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	opts.MultiModal = slices.Contains(info.Details.Families, "clip")
+	opts.MultiModal = len(info.ProjectorInfo) != 0
 	opts.ParentModel = info.Details.ParentModel
-	opts.Messages = append(opts.Messages, info.Messages...)
 
 	if interactive {
+		if err := loadOrUnloadModel(cmd, &opts); err != nil {
+			return err
+		}
+
+		for _, msg := range info.Messages {
+			switch msg.Role {
+			case "user":
+				fmt.Printf(">>> %s\n", msg.Content)
+			case "assistant":
+				state := &displayResponseState{}
+				displayResponse(msg.Content, opts.WordWrap, state)
+				fmt.Println()
+				fmt.Println()
+			}
+		}
+
 		return generateInteractive(cmd, opts)
 	}
 	return generate(cmd, opts)
-}
-
-func errFromUnknownKey(unknownKeyErr error) error {
-	// find SSH public key in the error message
-	sshKeyPattern := `ssh-\w+ [^\s"]+`
-	re := regexp.MustCompile(sshKeyPattern)
-	matches := re.FindStringSubmatch(unknownKeyErr.Error())
-
-	if len(matches) > 0 {
-		serverPubKey := matches[0]
-
-		localPubKey, err := auth.GetPublicKey()
-		if err != nil {
-			return unknownKeyErr
-		}
-
-		if runtime.GOOS == "linux" && serverPubKey != localPubKey {
-			// try the ollama service public key
-			svcPubKey, err := os.ReadFile("/usr/share/ollama/.ollama/id_ed25519.pub")
-			if err != nil {
-				return unknownKeyErr
-			}
-			localPubKey = strings.TrimSpace(string(svcPubKey))
-		}
-
-		// check if the returned public key matches the local public key, this prevents adding a remote key to the user's account
-		if serverPubKey != localPubKey {
-			return unknownKeyErr
-		}
-
-		var msg strings.Builder
-		msg.WriteString(unknownKeyErr.Error())
-		msg.WriteString("\n\nYour ollama key is:\n")
-		msg.WriteString(localPubKey)
-		msg.WriteString("\nAdd your key at:\n")
-		msg.WriteString("https://ollama.com/settings/keys")
-
-		return errors.New(msg.String())
-	}
-
-	return unknownKeyErr
 }
 
 func PushHandler(cmd *cobra.Command, args []string) error {
@@ -457,6 +562,8 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	request := api.PushRequest{Name: args[0], Insecure: insecure}
+
+	n := model.ParseName(args[0])
 	if err := client.Push(cmd.Context(), &request, fn); err != nil {
 		if spinner != nil {
 			spinner.Stop()
@@ -464,18 +571,19 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 		if strings.Contains(err.Error(), "access denied") {
 			return errors.New("you are not authorized to push to this namespace, create the model under a namespace you own")
 		}
-		host := model.ParseName(args[0]).Host
-		isOllamaHost := strings.HasSuffix(host, ".ollama.ai") || strings.HasSuffix(host, ".ollama.com")
-		if strings.Contains(err.Error(), errtypes.UnknownOllamaKeyErrMsg) && isOllamaHost {
-			// the user has not added their ollama key to ollama.com
-			// re-throw an error with a more user-friendly message
-			return errFromUnknownKey(err)
-		}
-
 		return err
 	}
 
+	p.Stop()
 	spinner.Stop()
+
+	destination := n.String()
+	if strings.HasSuffix(n.Host, ".ollama.ai") || strings.HasSuffix(n.Host, ".ollama.com") {
+		destination = "https://ollama.com/" + strings.TrimSuffix(n.DisplayShortest(), ":latest")
+	}
+	fmt.Printf("\nYou can find your model at:\n\n")
+	fmt.Printf("\t%s\n", destination)
+
 	return nil
 }
 
@@ -493,7 +601,7 @@ func ListHandler(cmd *cobra.Command, args []string) error {
 	var data [][]string
 
 	for _, m := range models.Models {
-		if len(args) == 0 || strings.HasPrefix(m.Name, args[0]) {
+		if len(args) == 0 || strings.HasPrefix(strings.ToLower(m.Name), strings.ToLower(args[0])) {
 			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), format.HumanTime(m.ModifiedAt, "Never")})
 		}
 	}
@@ -505,7 +613,7 @@ func ListHandler(cmd *cobra.Command, args []string) error {
 	table.SetHeaderLine(false)
 	table.SetBorder(false)
 	table.SetNoWhiteSpace(true)
-	table.SetTablePadding("\t")
+	table.SetTablePadding("    ")
 	table.AppendBulk(data)
 	table.Render()
 
@@ -540,7 +648,15 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 				cpuPercent := math.Round(float64(sizeCPU) / float64(m.Size) * 100)
 				procStr = fmt.Sprintf("%d%%/%d%% CPU/GPU", int(cpuPercent), int(100-cpuPercent))
 			}
-			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, format.HumanTime(m.ExpiresAt, "Never")})
+
+			var until string
+			delta := time.Since(m.ExpiresAt)
+			if delta > 0 {
+				until = "Stopping..."
+			} else {
+				until = format.HumanTime(m.ExpiresAt, "Never")
+			}
+			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, until})
 		}
 	}
 
@@ -551,7 +667,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 	table.SetHeaderLine(false)
 	table.SetBorder(false)
 	table.SetNoWhiteSpace(true)
-	table.SetTablePadding("\t")
+	table.SetTablePadding("    ")
 	table.AppendBulk(data)
 	table.Render()
 
@@ -562,6 +678,17 @@ func DeleteHandler(cmd *cobra.Command, args []string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return err
+	}
+
+	// Unload the model if it's running before deletion
+	opts := &runOptions{
+		Model:     args[0],
+		KeepAlive: &api.Duration{Duration: 0},
+	}
+	if err := loadOrUnloadModel(cmd, opts); err != nil {
+		if !strings.Contains(err.Error(), "not found") {
+			return fmt.Errorf("unable to stop existing running model \"%s\": %s", args[0], err)
+		}
 	}
 
 	for _, name := range args {
@@ -639,130 +766,97 @@ func ShowHandler(cmd *cobra.Command, args []string) error {
 		case "parameters":
 			fmt.Println(resp.Parameters)
 		case "system":
-			fmt.Println(resp.System)
+			fmt.Print(resp.System)
 		case "template":
-			fmt.Println(resp.Template)
+			fmt.Print(resp.Template)
 		}
 
 		return nil
 	}
 
-	showInfo(resp)
-
-	return nil
+	return showInfo(resp, os.Stdout)
 }
 
-func showInfo(resp *api.ShowResponse) {
-	arch := resp.ModelInfo["general.architecture"].(string)
+func showInfo(resp *api.ShowResponse, w io.Writer) error {
+	tableRender := func(header string, rows func() [][]string) {
+		fmt.Fprintln(w, " ", header)
+		table := tablewriter.NewWriter(w)
+		table.SetAlignment(tablewriter.ALIGN_LEFT)
+		table.SetBorder(false)
+		table.SetNoWhiteSpace(true)
+		table.SetTablePadding("    ")
 
-	modelData := [][]string{
-		{"arch", arch},
-		{"parameters", resp.Details.ParameterSize},
-		{"quantization", resp.Details.QuantizationLevel},
-		{"context length", fmt.Sprintf("%v", resp.ModelInfo[fmt.Sprintf("%s.context_length", arch)].(float64))},
-		{"embedding length", fmt.Sprintf("%v", resp.ModelInfo[fmt.Sprintf("%s.embedding_length", arch)].(float64))},
+		switch header {
+		case "Template", "System", "License":
+			table.SetColWidth(100)
+		}
+
+		table.AppendBulk(rows())
+		table.Render()
+		fmt.Fprintln(w)
 	}
 
-	mainTableData := [][]string{
-		{"Model"},
-		{renderSubTable(modelData, false)},
-	}
+	tableRender("Model", func() (rows [][]string) {
+		if resp.ModelInfo != nil {
+			arch := resp.ModelInfo["general.architecture"].(string)
+			rows = append(rows, []string{"", "architecture", arch})
+			rows = append(rows, []string{"", "parameters", format.HumanNumber(uint64(resp.ModelInfo["general.parameter_count"].(float64)))})
+			rows = append(rows, []string{"", "context length", strconv.FormatFloat(resp.ModelInfo[fmt.Sprintf("%s.context_length", arch)].(float64), 'f', -1, 64)})
+			rows = append(rows, []string{"", "embedding length", strconv.FormatFloat(resp.ModelInfo[fmt.Sprintf("%s.embedding_length", arch)].(float64), 'f', -1, 64)})
+		} else {
+			rows = append(rows, []string{"", "architecture", resp.Details.Family})
+			rows = append(rows, []string{"", "parameters", resp.Details.ParameterSize})
+		}
+		rows = append(rows, []string{"", "quantization", resp.Details.QuantizationLevel})
+		return
+	})
 
 	if resp.ProjectorInfo != nil {
-		projectorData := [][]string{
-			{"arch", "clip"},
-			{"parameters", format.HumanNumber(uint64(resp.ProjectorInfo["general.parameter_count"].(float64)))},
-		}
-
-		if projectorType, ok := resp.ProjectorInfo["clip.projector_type"]; ok {
-			projectorData = append(projectorData, []string{"projector type", projectorType.(string)})
-		}
-
-		projectorData = append(projectorData,
-			[]string{"embedding length", fmt.Sprintf("%v", resp.ProjectorInfo["clip.vision.embedding_length"].(float64))},
-			[]string{"projection dimensionality", fmt.Sprintf("%v", resp.ProjectorInfo["clip.vision.projection_dim"].(float64))},
-		)
-
-		mainTableData = append(mainTableData,
-			[]string{"Projector"},
-			[]string{renderSubTable(projectorData, false)},
-		)
+		tableRender("Projector", func() (rows [][]string) {
+			arch := resp.ProjectorInfo["general.architecture"].(string)
+			rows = append(rows, []string{"", "architecture", arch})
+			rows = append(rows, []string{"", "parameters", format.HumanNumber(uint64(resp.ProjectorInfo["general.parameter_count"].(float64)))})
+			rows = append(rows, []string{"", "embedding length", strconv.FormatFloat(resp.ProjectorInfo[fmt.Sprintf("%s.vision.embedding_length", arch)].(float64), 'f', -1, 64)})
+			rows = append(rows, []string{"", "dimensions", strconv.FormatFloat(resp.ProjectorInfo[fmt.Sprintf("%s.vision.projection_dim", arch)].(float64), 'f', -1, 64)})
+			return
+		})
 	}
 
 	if resp.Parameters != "" {
-		mainTableData = append(mainTableData, []string{"Parameters"}, []string{formatParams(resp.Parameters)})
+		tableRender("Parameters", func() (rows [][]string) {
+			scanner := bufio.NewScanner(strings.NewReader(resp.Parameters))
+			for scanner.Scan() {
+				if text := scanner.Text(); text != "" {
+					rows = append(rows, append([]string{""}, strings.Fields(text)...))
+				}
+			}
+			return
+		})
+	}
+
+	head := func(s string, n int) (rows [][]string) {
+		scanner := bufio.NewScanner(strings.NewReader(s))
+		for scanner.Scan() && (len(rows) < n || n < 0) {
+			if text := scanner.Text(); text != "" {
+				rows = append(rows, []string{"", strings.TrimSpace(text)})
+			}
+		}
+		return
 	}
 
 	if resp.System != "" {
-		mainTableData = append(mainTableData, []string{"System"}, []string{renderSubTable(twoLines(resp.System), true)})
+		tableRender("System", func() [][]string {
+			return head(resp.System, 2)
+		})
 	}
 
 	if resp.License != "" {
-		mainTableData = append(mainTableData, []string{"License"}, []string{renderSubTable(twoLines(resp.License), true)})
+		tableRender("License", func() [][]string {
+			return head(resp.License, 2)
+		})
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetAutoWrapText(false)
-	table.SetBorder(false)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-
-	for _, v := range mainTableData {
-		table.Append(v)
-	}
-
-	table.Render()
-}
-
-func renderSubTable(data [][]string, file bool) string {
-	var buf bytes.Buffer
-	table := tablewriter.NewWriter(&buf)
-	table.SetAutoWrapText(!file)
-	table.SetBorder(false)
-	table.SetNoWhiteSpace(true)
-	table.SetTablePadding("\t")
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-
-	for _, v := range data {
-		table.Append(v)
-	}
-
-	table.Render()
-
-	renderedTable := buf.String()
-	lines := strings.Split(renderedTable, "\n")
-	for i, line := range lines {
-		lines[i] = "\t" + line
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func twoLines(s string) [][]string {
-	lines := strings.Split(s, "\n")
-	res := [][]string{}
-
-	count := 0
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			count++
-			res = append(res, []string{line})
-			if count == 2 {
-				return res
-			}
-		}
-	}
-	return res
-}
-
-func formatParams(s string) string {
-	lines := strings.Split(s, "\n")
-	table := [][]string{}
-
-	for _, line := range lines {
-		table = append(table, strings.Fields(line))
-	}
-	return renderSubTable(table, false)
+	return nil
 }
 
 func CopyHandler(cmd *cobra.Command, args []string) error {
@@ -944,10 +1038,14 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 		return nil
 	}
 
+	if opts.Format == "json" {
+		opts.Format = `"` + opts.Format + `"`
+	}
+
 	req := &api.ChatRequest{
 		Model:    opts.Model,
 		Messages: opts.Messages,
-		Format:   opts.Format,
+		Format:   json.RawMessage(opts.Format),
 		Options:  opts.Options,
 	}
 
@@ -1029,12 +1127,16 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 		}
 	}
 
+	if opts.Format == "json" {
+		opts.Format = `"` + opts.Format + `"`
+	}
+
 	request := api.GenerateRequest{
 		Model:     opts.Model,
 		Prompt:    opts.Prompt,
 		Context:   generateContext,
 		Images:    opts.Images,
-		Format:    opts.Format,
+		Format:    json.RawMessage(opts.Format),
 		System:    opts.System,
 		Options:   opts.Options,
 		KeepAlive: opts.KeepAlive,
@@ -1071,12 +1173,12 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	return nil
 }
 
-func RunServer(cmd *cobra.Command, _ []string) error {
+func RunServer(_ *cobra.Command, _ []string) error {
 	if err := initializeKeypair(); err != nil {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", net.JoinHostPort(envconfig.Host.Host, envconfig.Host.Port))
+	ln, err := net.Listen("tcp", envconfig.Host().Host)
 	if err != nil {
 		return err
 	}
@@ -1145,7 +1247,7 @@ func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		if err := startApp(cmd.Context(), client); err != nil {
-			return fmt.Errorf("could not connect to ollama app, is it running?")
+			return errors.New("could not connect to ollama app, is it running?")
 		}
 	}
 	return nil
@@ -1190,7 +1292,7 @@ func NewCLI() *cobra.Command {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	cobra.EnableCommandSorting = false
 
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" && term.IsTerminal(int(os.Stdout.Fd())) {
 		console.ConsoleFromFile(os.Stdin) //nolint:errcheck
 	}
 
@@ -1222,7 +1324,7 @@ func NewCLI() *cobra.Command {
 		RunE:    CreateHandler,
 	}
 
-	createCmd.Flags().StringP("file", "f", "Modelfile", "Name of the Modelfile")
+	createCmd.Flags().StringP("file", "f", "", "Name of the Modelfile (default \"Modelfile\"")
 	createCmd.Flags().StringP("quantize", "q", "", "Quantize model to this level (e.g. q4_0)")
 
 	showCmd := &cobra.Command{
@@ -1252,6 +1354,15 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().Bool("insecure", false, "Use an insecure registry")
 	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
 	runCmd.Flags().String("format", "", "Response format (e.g. json)")
+
+	stopCmd := &cobra.Command{
+		Use:     "stop MODEL",
+		Short:   "Stop a running model",
+		Args:    cobra.ExactArgs(1),
+		PreRunE: checkServerHeartbeat,
+		RunE:    StopHandler,
+	}
+
 	serveCmd := &cobra.Command{
 		Use:     "serve",
 		Aliases: []string{"start"},
@@ -1311,6 +1422,19 @@ func NewCLI() *cobra.Command {
 		RunE:    DeleteHandler,
 	}
 
+	runnerCmd := &cobra.Command{
+		Use:    "runner",
+		Short:  llama.PrintSystemInfo(),
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runner.Execute(os.Args[1:])
+		},
+		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
+	}
+	runnerCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		_ = runner.Execute(args[1:])
+	})
+
 	envVars := envconfig.AsMap()
 
 	envs := []envconfig.EnvVar{envVars["OLLAMA_HOST"]}
@@ -1319,6 +1443,7 @@ func NewCLI() *cobra.Command {
 		createCmd,
 		showCmd,
 		runCmd,
+		stopCmd,
 		pullCmd,
 		pushCmd,
 		listCmd,
@@ -1341,9 +1466,13 @@ func NewCLI() *cobra.Command {
 				envVars["OLLAMA_NUM_PARALLEL"],
 				envVars["OLLAMA_NOPRUNE"],
 				envVars["OLLAMA_ORIGINS"],
+				envVars["OLLAMA_SCHED_SPREAD"],
 				envVars["OLLAMA_TMPDIR"],
 				envVars["OLLAMA_FLASH_ATTENTION"],
+				envVars["OLLAMA_KV_CACHE_TYPE"],
 				envVars["OLLAMA_LLM_LIBRARY"],
+				envVars["OLLAMA_GPU_OVERHEAD"],
+				envVars["OLLAMA_LOAD_TIMEOUT"],
 			})
 		default:
 			appendEnvDocs(cmd, envs)
@@ -1355,12 +1484,14 @@ func NewCLI() *cobra.Command {
 		createCmd,
 		showCmd,
 		runCmd,
+		stopCmd,
 		pullCmd,
 		pushCmd,
 		listCmd,
 		psCmd,
 		copyCmd,
 		deleteCmd,
+		runnerCmd,
 	)
 
 	return rootCmd
